@@ -7,6 +7,8 @@
 #include <cassert>
 #include <queue>
 #include <cstring>
+#include <algorithm>
+#include <utility> // Added for std::pair
 
 // PQ配置参数
 constexpr int PQ_M = 16;  // 子空间数量，
@@ -24,39 +26,16 @@ struct PQIndex {
     
     // 查询时用的距离表
     float* dist_tables;  // 大小为 M * K
-    
-    PQIndex(int m = PQ_M, int k = PQ_K) : M(m), K(k), dist_tables(nullptr) {}
+    // 添加原始数据指针以进行重排
+    const float* base_data; 
+    size_t base_num;
+
+    PQIndex(int m = PQ_M, int k = PQ_K) : M(m), K(k), dist_tables(nullptr), base_data(nullptr), base_num(0) {}
     
     ~PQIndex() {
         if (dist_tables) {
             delete[] dist_tables;
         }
-    }
-
-    // 使用NEON加速计算内积
-    float compute_inner_product_neon(const float* a, const float* b, int n) {
-        float32x4_t sum_vec = vdupq_n_f32(0);
-        int i = 0;
-        
-        // 每次处理4个元素
-        for (; i <= n - 4; i += 4) {
-            float32x4_t va = vld1q_f32(a + i);
-            float32x4_t vb = vld1q_f32(b + i);
-            sum_vec = vmlaq_f32(sum_vec, va, vb);
-        }
-        
-        // 水平求和
-        float sum = vgetq_lane_f32(sum_vec, 0) + 
-                   vgetq_lane_f32(sum_vec, 1) +
-                   vgetq_lane_f32(sum_vec, 2) + 
-                   vgetq_lane_f32(sum_vec, 3);
-        
-        // 处理剩余元素
-        for (; i < n; i++) {
-            sum += a[i] * b[i];
-        }
-        
-        return sum;
     }
     
     //使用NEON加速计算距离表
@@ -79,7 +58,6 @@ struct PQIndex {
             }
         }
     }
-    
     
     // 加载索引
     bool load(const std::string& filename) {
@@ -115,33 +93,95 @@ struct PQIndex {
         fin.close();
         return true;
     }
+
+    // 设置原始数据指针，用于重排
+    void set_base_data(const float* base, size_t n) {
+        base_data = base;
+        base_num = n;
+    }
+
+    // 计算两个向量之间的精确平方欧氏距离
+    float compute_exact_distance(const float* vec1, const float* vec2, int dimension) {
+        float dist = 0.0f;
+        // 可以添加 SIMD 优化
+        for (int d = 0; d < dimension; ++d) {
+            float diff = vec1[d] - vec2[d];
+            dist += diff * diff;
+        }
+        return dist;
+    }
     
-    // 使用预计算的距离表进行查询
-    std::priority_queue<std::pair<float, uint32_t>> query(const float* query_vec, int k) {
-        // 计算距离表
+    // 使用预计算的距离表进行查询，并进行重排
+    std::priority_queue<std::pair<float, uint32_t>> query(const float* query_vec, int k, int rerank_k) {
+        if (!base_data) {
+             std::cerr << "Error: Base data not set for reranking." << std::endl;
+             // 返回空结果或者抛出异常
+             return std::priority_queue<std::pair<float, uint32_t>>();
+        }
+        if (rerank_k < k) {
+            rerank_k = k; // 确保 rerank_k 至少为 k
+            std::cerr << "Warning: rerank_k is less than k. Setting rerank_k = k." << std::endl;
+        }
+        if (rerank_k > codes.size()) {
+             rerank_k = codes.size(); // rerank_k 不能超过总数据量
+             std::cerr << "Warning: rerank_k is greater than the number of base vectors. Setting rerank_k to base size." << std::endl;
+        }
+
+
+        // 1. 计算距离表
         compute_distance_table_neon(query_vec);
         
-        // 使用距离表进行查询
-        std::priority_queue<std::pair<float, uint32_t>> result;
+        // 2. 使用 PQ 近似距离进行初步检索，获取 top rerank_k 候选
+        std::priority_queue<std::pair<float, uint32_t>> approx_result_pq; // Max-heap for approx distances
         
         for (size_t i = 0; i < codes.size(); i++) {
-            float dist = 0;
-            
+            float approx_dist = 0;
             // 累加每个子空间的距离
             for (int m = 0; m < M; m++) {
                 uint8_t code = codes[i][m];
-                dist += dist_tables[m * K + code];
+                approx_dist += dist_tables[m * K + code];
             }
             
-            if (result.size() < k) {
-                result.push(std::make_pair(dist, i));
-            } else if (dist < result.top().first) {
-                result.push(std::make_pair(dist, i));
-                result.pop();
+            if (approx_result_pq.size() < rerank_k) {
+                approx_result_pq.push({approx_dist, (uint32_t)i});
+            } else if (approx_dist < approx_result_pq.top().first) {
+                approx_result_pq.pop();
+                approx_result_pq.push({approx_dist, (uint32_t)i});
+            }
+        }
+
+        // 3. 提取 rerank_k 候选 ID
+        std::vector<uint32_t> candidate_ids;
+        candidate_ids.reserve(approx_result_pq.size());
+        while (!approx_result_pq.empty()) {
+            candidate_ids.push_back(approx_result_pq.top().second);
+            approx_result_pq.pop();
+        }
+        // 反转，因为 priority_queue 是最大堆，我们想要距离最近的
+        std::reverse(candidate_ids.begin(), candidate_ids.end());
+
+
+        // 4. 计算精确距离并进行重排
+        std::priority_queue<std::pair<float, uint32_t>> final_result_pq; // Max-heap for exact distances
+
+        for (uint32_t id : candidate_ids) {
+             if (id >= base_num) { // 安全检查
+                 std::cerr << "Error: Candidate ID " << id << " out of bounds (" << base_num << ")" << std::endl;
+                 continue;
+             }
+            const float* base_vec = base_data + (size_t)id * dim; // 获取原始向量指针
+            float exact_dist = compute_exact_distance(query_vec, base_vec, dim);
+
+            if (final_result_pq.size() < k) {
+                final_result_pq.push({exact_dist, id});
+            } else if (exact_dist < final_result_pq.top().first) {
+                final_result_pq.pop();
+                final_result_pq.push({exact_dist, id});
             }
         }
         
-        return result;
+        // 5. 返回最终 top-k 结果 (priority_queue 内部已按距离排序)
+        return final_result_pq;
     }
 };
 
@@ -149,7 +189,10 @@ struct PQIndex {
 static PQIndex g_pq_index;
 
 
-std::priority_queue<std::pair<float, uint32_t>> pq_search(float* base, float* query, size_t base_number, size_t vecdim, size_t k) {
-    // 使用PQ索引查询
-    return g_pq_index.query(query, k);
+// 更新 pq_search 包装函数以接受 rerank_k 参数
+std::priority_queue<std::pair<float, uint32_t>> pq_search(float* base, float* query, size_t base_number, size_t vecdim, size_t k, int rerank_k) {
+    // 确保在查询前设置了原始数据指针
+    g_pq_index.set_base_data(base, base_number); 
+    // 使用PQ索引查询并进行重排
+    return g_pq_index.query(query, k, rerank_k);
 }

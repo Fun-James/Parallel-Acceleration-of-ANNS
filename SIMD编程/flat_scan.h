@@ -22,6 +22,7 @@ std::priority_queue<std::pair<float, uint32_t> > flat_search(float* base, float*
             if(dis < q.top().first) {
                 q.push({dis, i});
                 q.pop();
+            }
         }
     }
     return q;

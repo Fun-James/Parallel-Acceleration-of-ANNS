@@ -13,7 +13,7 @@
 #include "flat_scan.h"
 // 可以自行添加需要的头文件
 #include "simd.h"
-#include "PQ.h"
+#include "pq.h"
 using namespace hnswlib;
 
 template<typename T>
@@ -253,7 +253,7 @@ void build_pq_index(float *base, size_t base_number, size_t vecdim)
     }
 
     // 保存索引到文件
-    std::ofstream fout("files/pq.index32", std::ios::binary);
+    std::ofstream fout("files/pq.index16256", std::ios::binary);
     fout.write(reinterpret_cast<const char *>(&PQ_M), sizeof(int));
     fout.write(reinterpret_cast<const char *>(&PQ_K), sizeof(int));
     fout.write(reinterpret_cast<const char *>(&vecdim), sizeof(int));
@@ -284,7 +284,7 @@ int main(int argc, char *argv[])
     size_t test_number = 0, base_number = 0;
     size_t test_gt_d = 0, vecdim = 0;
 
-    std::string data_path = "/anndata/"; 
+    std::string data_path = "anndata/"; 
     auto test_query = LoadData<float>(data_path + "DEEP100K.query.fbin", test_number, vecdim);
     auto test_gt = LoadData<int>(data_path + "DEEP100K.gt.query.100k.top100.bin", test_number, test_gt_d);
     auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
@@ -292,6 +292,7 @@ int main(int argc, char *argv[])
     test_number = 2000;
 
     const size_t k = 10;
+    const int rerank_k = 100; // 定义 rerank 候选数量，例如 k 的 10 倍
 
     std::vector<SearchResult> results;
     results.resize(test_number);
@@ -303,12 +304,19 @@ int main(int argc, char *argv[])
     // 下面是一个构建hnsw索引的示例
     // build_index(base, base_number, vecdim);
      // 在查询之前构建或加载PQ索引
-     if (!g_pq_index.load("files/pq.index32")) {
+     if (!g_pq_index.load("files/pq.index16256")) {
+        std::cout << "Building PQ index..." << std::endl;
         build_pq_index(base, base_number, vecdim);
+        std::cout << "PQ index built and saved." << std::endl;
+    } else {
+        std::cout << "Loaded PQ index from file." << std::endl;
     }
+    // 设置原始数据指针，这也可以在循环外完成一次
+    // g_pq_index.set_base_data(base, base_number); // 在 pq_search 内部调用了
 
     
     // 查询测试代码
+    std::cout << "Starting PQ search with rerank (k=" << k << ", rerank_k=" << rerank_k << ")..." << std::endl;
     for(int i = 0; i < test_number; ++i) {
         const unsigned long Converter = 1000 * 1000;
         struct timeval val;
@@ -316,7 +324,7 @@ int main(int argc, char *argv[])
 
         // 该文件已有代码中你只能修改该函数的调用方式
         // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        auto res = pq_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        auto res = pq_search(base, test_query + i*vecdim, base_number, vecdim, k, rerank_k);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
@@ -350,5 +358,11 @@ int main(int argc, char *argv[])
     // 浮点误差可能导致一些精确算法平均recall不是1
     std::cout << "average recall: "<<avg_recall / test_number<<"\n";
     std::cout << "average latency (us): "<<avg_latency / test_number<<"\n";
+
+    // 释放内存
+    delete[] test_query;
+    delete[] test_gt;
+    delete[] base;
+
     return 0;
 }

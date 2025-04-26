@@ -12,7 +12,7 @@
 
 // PQ配置参数
 constexpr int PQ_M = 16;  // 子空间数量，
-constexpr int PQ_K = 256;  // 聚类数量，
+constexpr int PQ_K = 16;  // 聚类数量，
 
 // PQ索引结构
 struct PQIndex {

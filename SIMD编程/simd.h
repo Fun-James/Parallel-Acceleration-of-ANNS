@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// 使用ARM NEON指令实现的内积计算函数
+// 使用ARM NEON指令实现的内积计算函数(并行度8)
 float InnerProductSIMDNeon(const float* b1, const float* b2, size_t vecdim) {
     
     // 初始化累加寄存器为0

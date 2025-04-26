@@ -253,7 +253,7 @@ void build_pq_index(float *base, size_t base_number, size_t vecdim)
     }
 
     // 保存索引到文件
-    std::ofstream fout("files/pq.index16256", std::ios::binary);
+    std::ofstream fout("files/pq.index1616", std::ios::binary);
     fout.write(reinterpret_cast<const char *>(&PQ_M), sizeof(int));
     fout.write(reinterpret_cast<const char *>(&PQ_K), sizeof(int));
     fout.write(reinterpret_cast<const char *>(&vecdim), sizeof(int));
@@ -292,7 +292,7 @@ int main(int argc, char *argv[])
     test_number = 2000;
 
     const size_t k = 10;
-    const int rerank_k = 100; // 定义 rerank 候选数量，例如 k 的 10 倍
+    const int rerank_k = 280; // 定义 rerank 候选数量，例如 k 的 10 倍
 
     std::vector<SearchResult> results;
     results.resize(test_number);
@@ -304,7 +304,7 @@ int main(int argc, char *argv[])
     // 下面是一个构建hnsw索引的示例
     // build_index(base, base_number, vecdim);
      // 在查询之前构建或加载PQ索引
-     if (!g_pq_index.load("files/pq.index16256")) {
+     if (!g_pq_index.load("files/pq.index1616")) {
         std::cout << "Building PQ index..." << std::endl;
         build_pq_index(base, base_number, vecdim);
         std::cout << "PQ index built and saved." << std::endl;

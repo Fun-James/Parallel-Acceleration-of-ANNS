@@ -30,11 +30,11 @@ struct PQIndex {
 
     /*************   Fast‑Scan runtime 缓存  *************/
     bool              fastscan_ok = false;
-    uint8_t*          codes_fs    = nullptr;  
+    uint8_t*          codes_fs    = nullptr;   
     size_t            ntotal{};                
-    size_t            ntotal2{};             
+    size_t            ntotal2{};              
     float             last_scale{};            
-    uint8_t           LUT_q8[PQ_M * PQ_K]{};  
+    uint8_t           LUT_q8[PQ_M * PQ_K]{};   
 
     /*************   rerank 用到的原始数据  *************/
     const float*      base_data = nullptr;
@@ -49,7 +49,7 @@ struct PQIndex {
         ntotal  = codes.size();
         ntotal2 = roundup(ntotal, BLOCK);
         if (codes_fs) delete[] codes_fs;
-        codes_fs = new uint8_t[ntotal2 * M]();       
+        codes_fs = new uint8_t[ntotal2 * M]();        
         for (size_t i = 0; i < ntotal; ++i) {
             size_t blk  = i / BLOCK;
             size_t pos  = i % BLOCK;
@@ -63,7 +63,7 @@ struct PQIndex {
     }
 
     /****************************************************************
-     *  2)  构建本 query 的 LUT 并量化到 uint8  (线性 scale)
+     *  2)  构建本 query 的 LUT 并量化到 uint8  
      ****************************************************************/
     void build_quantized_LUT(const float* query) {
         assert(codebooks.size() == (size_t)M);
@@ -137,7 +137,7 @@ struct PQIndex {
     }
 
     /****************************************************************
-     *  4)  对外查询接口：返回 top‑k id (距离越小越好)
+     *  4)  对外查询接口：返回 top‑k id 
      ****************************************************************/
     std::priority_queue<std::pair<float, uint32_t>>
     query(const float* q, int k, int rerank_k)
@@ -169,23 +169,24 @@ std::priority_queue<
             }
         }
 
-        /************ 5)  精确距离重排 (沿用你原先的 SIMD 函数) ************/
+        /************ 5)  精确距离重排 (使用内积距离) ************/
         auto exact_dist = [&](const float* a, const float* b)->float {
             float32x4_t acc = vdupq_n_f32(0);
             int d=0;
             for (; d+3 < dim; d+=4){
                 float32x4_t va=vld1q_f32(a+d);
                 float32x4_t vb=vld1q_f32(b+d);
-                float32x4_t diff=vsubq_f32(va,vb);
-                acc = vfmaq_f32(acc,diff,diff);
+                // 计算内积
+                acc = vfmaq_f32(acc, va, vb);
             }
             float tmp[4]; vst1q_f32(tmp, acc);
             float res = tmp[0]+tmp[1]+tmp[2]+tmp[3];
             for (; d<dim; ++d){
-                float diff=a[d]-b[d];
-                res += diff*diff;
+                // 剩余元素的内积
+                res += a[d] * b[d];
             }
-            return res;
+            // 返回负内积作为距离（内积越大越相似，距离应该越小）
+            return -res;
         };
 
         std::priority_queue<std::pair<float,uint32_t>> final_top;

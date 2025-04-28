@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "iosfwd": "cpp",
+        "queue": "cpp"
+    },
+    "cmake.ignoreCMakeListsMissing": true
+}

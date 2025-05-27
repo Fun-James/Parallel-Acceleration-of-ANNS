@@ -1,0 +1,10 @@
+{
+    "terminal.integrated.defaultProfile.windows": "Command Prompt",
+    "files.associations": {
+        "*.h": "cpp",
+        "*.cc": "cpp"
+    },
+    "C_Cpp.default.compilerPath": "g++.exe",
+    "C_Cpp.default.cppStandard": "c++11",
+    "C_Cpp.default.intelliSenseMode": "gcc-x64"
+}

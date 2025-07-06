@@ -3,12 +3,13 @@
 #include <fstream>
 #include <vector>
 #include <cmath>
-#include <arm_neon.h>  // ARM NEON 指令集
+
 #include <cassert>
 #include <queue>
 #include <cstring>
 #include <algorithm>
 #include <utility> // Added for std::pair
+#include <omp.h> // OpenMP支持
 
 // PQ配置参数
 constexpr int PQ_M = 16;  // 子空间数量，
@@ -38,22 +39,25 @@ struct PQIndex {
         }
     }
     
-    //使用NEON加速计算距离表
-    void compute_distance_table_neon(const float* query) {
+    //使用OpenMP加速计算距离表
+    void compute_distance_table_avx2(const float* query) {
         if (!dist_tables) {
             dist_tables = new float[M * K];
         }
-        // 为每个子空间计算距离表
+        // 使用OpenMP并行化子空间的距离表计算
+        #pragma omp parallel for schedule(static)
         for (int m = 0; m < M; m++) {
             const float* query_sub = query + m * sub_dim;
             for (int k = 0; k < K; k++) {
                 const float* centroid = codebooks[m][k].data();
                 float dist = 0.0f;
-                // 累加子空间内的欧几里得距离平方
+                
+                // 标量计算
                 for (int d = 0; d < sub_dim; d++) {
                     float diff = query_sub[d] - centroid[d];
                     dist += diff * diff;
                 }
+                
                 dist_tables[m * K + k] = dist;
             }
         }
@@ -103,7 +107,8 @@ struct PQIndex {
     // 计算两个向量之间的精确平方欧氏距离
     float compute_exact_distance(const float* vec1, const float* vec2, int dimension) {
         float dist = 0.0f;
-        // 可以添加 SIMD 优化
+        
+        // 标量计算
         for (int d = 0; d < dimension; ++d) {
             float diff = vec1[d] - vec2[d];
             dist += diff * diff;
@@ -111,7 +116,7 @@ struct PQIndex {
         return dist;
     }
     
-    // 使用预计算的距离表进行查询，并进行重排
+    // 使用预计算的距离表进行查询，并进行重排（OpenMP优化版本）
     std::priority_queue<std::pair<float, uint32_t>> query(const float* query_vec, int k, int rerank_k) {
         if (!base_data) {
              std::cerr << "Error: Base data not set for reranking." << std::endl;
@@ -127,26 +132,55 @@ struct PQIndex {
              std::cerr << "Warning: rerank_k is greater than the number of base vectors. Setting rerank_k to base size." << std::endl;
         }
 
-
-        // 1. 计算距离表
-        compute_distance_table_neon(query_vec);
+        // 1. 计算距离表（已经OpenMP优化）
+        compute_distance_table_avx2(query_vec);
         
         // 2. 使用 PQ 近似距离进行初步检索，获取 top rerank_k 候选
-        std::priority_queue<std::pair<float, uint32_t>> approx_result_pq; // Max-heap for approx distances
+        // 为了并行化，我们使用分块策略
+        const int num_threads = omp_get_max_threads();
+        const size_t chunk_size = (codes.size() + num_threads - 1) / num_threads;
         
-        for (size_t i = 0; i < codes.size(); i++) {
-            float approx_dist = 0;
-            // 累加每个子空间的距离
-            for (int m = 0; m < M; m++) {
-                uint8_t code = codes[i][m];
-                approx_dist += dist_tables[m * K + code];
-            }
+        // 每个线程维护自己的top-k结果
+        std::vector<std::priority_queue<std::pair<float, uint32_t>>> thread_results(num_threads);
+        
+        #pragma omp parallel
+        {
+            int thread_id = omp_get_thread_num();
+            size_t start_idx = thread_id * chunk_size;
+            size_t end_idx = std::min(start_idx + chunk_size, codes.size());
             
-            if (approx_result_pq.size() < rerank_k) {
-                approx_result_pq.push({approx_dist, (uint32_t)i});
-            } else if (approx_dist < approx_result_pq.top().first) {
-                approx_result_pq.pop();
-                approx_result_pq.push({approx_dist, (uint32_t)i});
+            auto& local_pq = thread_results[thread_id];
+            
+            for (size_t i = start_idx; i < end_idx; i++) {
+                float approx_dist = 0;
+                // 累加每个子空间的距离
+                for (int m = 0; m < M; m++) {
+                    uint8_t code = codes[i][m];
+                    approx_dist += dist_tables[m * K + code];
+                }
+                
+                if (local_pq.size() < rerank_k) {
+                    local_pq.push({approx_dist, (uint32_t)i});
+                } else if (approx_dist < local_pq.top().first) {
+                    local_pq.pop();
+                    local_pq.push({approx_dist, (uint32_t)i});
+                }
+            }
+        }
+        
+        // 合并线程结果
+        std::priority_queue<std::pair<float, uint32_t>> approx_result_pq;
+        for (int t = 0; t < num_threads; t++) {
+            while (!thread_results[t].empty()) {
+                auto item = thread_results[t].top();
+                thread_results[t].pop();
+                
+                if (approx_result_pq.size() < rerank_k) {
+                    approx_result_pq.push(item);
+                } else if (item.first < approx_result_pq.top().first) {
+                    approx_result_pq.pop();
+                    approx_result_pq.push(item);
+                }
             }
         }
 
@@ -160,23 +194,50 @@ struct PQIndex {
         // 反转，因为 priority_queue 是最大堆，我们想要距离最近的
         std::reverse(candidate_ids.begin(), candidate_ids.end());
 
+        // 4. 计算精确距离并进行重排（OpenMP并行化）
+        // 每个线程维护自己的top-k结果
+        std::vector<std::priority_queue<std::pair<float, uint32_t>>> rerank_thread_results(num_threads);
+        
+        #pragma omp parallel
+        {
+            int thread_id = omp_get_thread_num();
+            size_t thread_chunk_size = (candidate_ids.size() + num_threads - 1) / num_threads;
+            size_t start_idx = thread_id * thread_chunk_size;
+            size_t end_idx = std::min(start_idx + thread_chunk_size, candidate_ids.size());
+            
+            auto& local_pq = rerank_thread_results[thread_id];
+            
+            for (size_t idx = start_idx; idx < end_idx; idx++) {
+                uint32_t id = candidate_ids[idx];
+                if (id >= base_num) { // 安全检查
+                    continue;
+                }
+                
+                const float* base_vec = base_data + (size_t)id * dim; // 获取原始向量指针
+                float exact_dist = compute_exact_distance(query_vec, base_vec, dim);
 
-        // 4. 计算精确距离并进行重排
-        std::priority_queue<std::pair<float, uint32_t>> final_result_pq; // Max-heap for exact distances
-
-        for (uint32_t id : candidate_ids) {
-             if (id >= base_num) { // 安全检查
-                 std::cerr << "Error: Candidate ID " << id << " out of bounds (" << base_num << ")" << std::endl;
-                 continue;
-             }
-            const float* base_vec = base_data + (size_t)id * dim; // 获取原始向量指针
-            float exact_dist = compute_exact_distance(query_vec, base_vec, dim);
-
-            if (final_result_pq.size() < k) {
-                final_result_pq.push({exact_dist, id});
-            } else if (exact_dist < final_result_pq.top().first) {
-                final_result_pq.pop();
-                final_result_pq.push({exact_dist, id});
+                if (local_pq.size() < k) {
+                    local_pq.push({exact_dist, id});
+                } else if (exact_dist < local_pq.top().first) {
+                    local_pq.pop();
+                    local_pq.push({exact_dist, id});
+                }
+            }
+        }
+        
+        // 合并重排结果
+        std::priority_queue<std::pair<float, uint32_t>> final_result_pq;
+        for (int t = 0; t < num_threads; t++) {
+            while (!rerank_thread_results[t].empty()) {
+                auto item = rerank_thread_results[t].top();
+                rerank_thread_results[t].pop();
+                
+                if (final_result_pq.size() < k) {
+                    final_result_pq.push(item);
+                } else if (item.first < final_result_pq.top().first) {
+                    final_result_pq.pop();
+                    final_result_pq.push(item);
+                }
             }
         }
         

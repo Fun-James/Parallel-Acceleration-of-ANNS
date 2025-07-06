@@ -12,7 +12,7 @@
 #include "hnswlib/hnswlib/hnswlib.h"
 // 可以自行添加需要的头文件
 
-#include "pqflat.h"
+#include "pqflat_openMP.h"
 using namespace hnswlib;
 
 template<typename T>
@@ -76,8 +76,9 @@ void build_pq_index(float *base, size_t base_number, size_t vecdim)
         }
     }
 
-    // 计算每个维度的均值作为初始聚类中心
+    // 计算每个维度的均值作为初始聚类中心（OpenMP并行化）
     std::vector<std::vector<float>> sub_means(PQ_M);
+    #pragma omp parallel for schedule(static)
     for (int m = 0; m < PQ_M; m++)
     {
         sub_means[m].resize(g_pq_index.sub_dim, 0.0f);
@@ -146,7 +147,8 @@ void build_pq_index(float *base, size_t base_number, size_t vecdim)
             clusters[m].resize(PQ_K);
         }
 
-        // 分配数据点到最近的聚类中心
+        // 分配数据点到最近的聚类中心（OpenMP并行化）
+        #pragma omp parallel for schedule(dynamic, 100)
         for (size_t i = 0; i < base_number; i++)
         {
             for (int m = 0; m < PQ_M; m++)
@@ -170,7 +172,10 @@ void build_pq_index(float *base, size_t base_number, size_t vecdim)
                     }
                 }
 
-                clusters[m][best_k].push_back(i);
+                #pragma omp critical
+                {
+                    clusters[m][best_k].push_back(i);
+                }
             }
         }
 
@@ -232,8 +237,9 @@ void build_pq_index(float *base, size_t base_number, size_t vecdim)
         }
     }
 
-    // 对所有数据点进行编码
+    // 对所有数据点进行编码（OpenMP并行化）
     g_pq_index.codes.resize(base_number);
+    #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < base_number; i++)
     {
         g_pq_index.codes[i].resize(PQ_M);
@@ -289,6 +295,10 @@ void build_pq_index(float *base, size_t base_number, size_t vecdim)
 
 int main(int argc, char *argv[])
 {
+    // 设置OpenMP线程数，可以根据CPU核心数调整
+    omp_set_num_threads(8);
+    std::cout << "Using " << omp_get_max_threads() << " OpenMP threads." << std::endl;
+    
     size_t test_number = 0, base_number = 0;
     size_t test_gt_d = 0, vecdim = 0;
 
@@ -313,9 +323,14 @@ int main(int argc, char *argv[])
     // build_index(base, base_number, vecdim);
      // 在查询之前构建或加载PQ索引
      if (!g_pq_index.load("files/pq.index1616")) {
-        std::cout << "Building PQ index..." << std::endl;
+        std::cout << "Building PQ index with OpenMP parallelization..." << std::endl;
+        auto build_start = std::chrono::high_resolution_clock::now();
+        
         build_pq_index(base, base_number, vecdim);
-        std::cout << "PQ index built and saved." << std::endl;
+        
+        auto build_end = std::chrono::high_resolution_clock::now();
+        auto build_time = std::chrono::duration_cast<std::chrono::milliseconds>(build_end - build_start).count();
+        std::cout << "PQ index built and saved in " << build_time << " ms." << std::endl;
     } else {
         std::cout << "Loaded PQ index from file." << std::endl;
     }
